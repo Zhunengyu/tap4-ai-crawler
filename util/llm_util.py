@@ -1,98 +1,86 @@
 import os
-from dotenv import load_dotenv
-from groq import Groq
-import logging
-from transformers import LlamaTokenizer
-from util.common_util import CommonUtil
+import json
+import requests
+from logging import getLogger
 
-# 设置日志记录
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(filename)s - %(funcName)s - %(lineno)d - %(levelname)s - %(message)s'
-)
-logger = logging.getLogger(__name__)
-util = CommonUtil()
-# 初始化LLaMA模型的Tokenizer
-tokenizer = LlamaTokenizer.from_pretrained("huggyllama/llama-65b")
+logger = getLogger(__name__)
 
 class LLMUtil:
     def __init__(self):
-        load_dotenv()
-        self.groq_api_key = os.getenv('GROQ_API_KEY')
-        logger.info(f"Groq API Key:{self.groq_api_key}")
-        self.detail_sys_prompt = os.getenv('DETAIL_SYS_PROMPT')
-        self.tag_selector_sys_prompt = os.getenv('TAG_SELECTOR_SYS_PROMPT')
-        self.language_sys_prompt = os.getenv('LANGUAGE_SYS_PROMPT')
-        self.groq_model = os.getenv('GROQ_MODEL')
-        self.groq_max_tokens = int(os.getenv('GROQ_MAX_TOKENS', 5000))
-        self.client = Groq(
-            api_key=self.groq_api_key
-        )
-
-    def process_detail(self, user_prompt):
-        logger.info("正在处理Detail...")
-        return util.detail_handle(self.process_prompt(self.detail_sys_prompt, user_prompt))
-
-    def process_tags(self, user_prompt):
-        logger.info(f"正在处理tags...")
-        result = self.process_prompt(self.tag_selector_sys_prompt, user_prompt)
-        # 将result（逗号分割的字符串）转为数组
-        if result:
-            tags = [element.strip() for element in result.split(',')]
-        else:
-            tags = []
-        logger.info(f"tags处理结果:{tags}")
-        return tags
-
-    def process_language(self, language, user_prompt):
-        logger.info(f"正在处理多语言:{language}, user_prompt:{user_prompt}")
-        # 如果language 包含 English字符，则直接返回
-        if 'english'.lower() in language.lower():
-            result = user_prompt
-        else:
-            result = self.process_prompt(self.language_sys_prompt.replace("{language}", language), user_prompt)
-            if result and not user_prompt.startswith("#"):
-                # 如果原始输入没有包含###开头的markdown标记，则去掉markdown标记
-                result = result.replace("### ", "").replace("## ", "").replace("# ", "").replace("**", "")
-        logger.info(f"多语言:{language}, 处理结果:{result}")
-        return result
-
-    def process_prompt(self, sys_prompt, user_prompt):
-        if not sys_prompt:
-            logger.info(f"LLM无需处理，sys_prompt为空:{sys_prompt}")
-            return None
-        if not user_prompt:
-            logger.info(f"LLM无需处理，user_prompt为空:{user_prompt}")
-            return None
-
-        logger.info("LLM正在处理")
+        # DeepSeek API 配置
+        self.api_key = os.getenv('DEEPSEEK_API_KEY', '')  # 从环境变量获取 API 密钥
+        self.api_url = "https://api.deepseek.com/v1/chat/completions"  # DeepSeek API 端点
+        self.model = "deepseek-chat"  # 或者您想使用的其他 DeepSeek 模型
+    
+    def _call_deepseek_api(self, prompt):
+        """调用 DeepSeek API"""
         try:
-            tokens = tokenizer.encode(user_prompt)
-            if len(tokens) > self.groq_max_tokens:
-                logger.info(f"用户输入长度超过{self.groq_max_tokens}，进行截取")
-                truncated_tokens = tokens[:self.groq_max_tokens]
-                user_prompt = tokenizer.decode(truncated_tokens)
-
-            chat_completion = self.client.chat.completions.create(
-                messages=[
-                    {
-                        "role": "system",
-                        "content": sys_prompt,
-                    },
-                    {
-                        "role": "user",
-                        "content": user_prompt,
-                    }
-                ],
-                model=self.groq_model,
-                temperature=0.2,
-            )
-            if chat_completion.choices[0] and chat_completion.choices[0].message:
-                logger.info(f"LLM完成处理，成功响应!")
-                return chat_completion.choices[0].message.content
-            else:
-                logger.info("LLM完成处理，处理结果为空")
-                return None
+            headers = {
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {self.api_key}"
+            }
+            payload = {
+                "model": self.model,
+                "messages": [{"role": "user", "content": prompt}]
+            }
+            
+            response = requests.post(self.api_url, headers=headers, json=payload)
+            response.raise_for_status()  # 检查请求是否成功
+            
+            result = response.json()
+            return result["choices"][0]["message"]["content"]
         except Exception as e:
-            logger.error(f"LLM处理失败", e)
-            return None
+            logger.error(f"DeepSeek API 调用失败: {str(e)}")
+            # 返回一个简单的备用响应
+            return "无法获取详细描述。请稍后再试。"
+    
+    def process_detail(self, content):
+        """处理网页内容，生成详细描述"""
+        # 提取一部分内容（避免超过 API 限制）
+        truncated_content = content[:4000] if len(content) > 4000 else content
+        
+        prompt = f"""
+        请根据以下网页内容，生成一个详细的 Markdown 格式描述，包括：
+        1. 一级标题（网站名称）
+        2. 简短介绍（2-3句话）
+        3. 主要功能（列表形式）
+        4. 使用场景（列表形式）
+        5. 简短结论
+
+        网页内容:
+        {truncated_content}
+        """
+        
+        return self._call_deepseek_api(prompt)
+    
+    def process_tags(self, text):
+        """根据内容生成标签"""
+        prompt = f"""
+        根据以下文本，生成5个最相关的标签词（单个词或短语）。
+        格式要求：返回一个 JSON 数组，如 ["tag1", "tag2", "tag3", "tag4", "tag5"]
+
+        文本: {text}
+        """
+        
+        try:
+            result = self._call_deepseek_api(prompt)
+            # 尝试解析 JSON 数组
+            tags = json.loads(result)
+            if isinstance(tags, list):
+                return tags[:5]  # 确保最多返回5个标签
+        except:
+            # 如果解析失败，返回默认标签
+            logger.error("标签解析失败，返回默认标签")
+        
+        return ["website", "online", "ai", "tool"]
+    
+    def process_language(self, language, text):
+        """将文本翻译成指定语言"""
+        prompt = f"""
+        请将以下文本翻译成{language}语言:
+
+        {text}
+        """
+        
+        result = self._call_deepseek_api(prompt)
+        return result
