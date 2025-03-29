@@ -2,7 +2,9 @@ from bs4 import BeautifulSoup
 import logging
 import time
 import random
-from pyppeteer import launch
+import requests
+import os
+import traceback
 
 from util.common_util import CommonUtil
 from util.llm_util import LLMUtil
@@ -35,7 +37,7 @@ global_agent_headers = [
 
 class WebsitCrawler:
     def __init__(self):
-        self.browser = None
+        pass  # 不再需要初始化浏览器
 
     # 爬取指定URL网页内容
     async def scrape_website(self, url, tags, languages):
@@ -44,36 +46,31 @@ class WebsitCrawler:
             # 记录程序开始时间
             start_time = int(time.time())
             logger.info("正在处理：" + url)
+            
+            # 确保 URL 格式正确
             if not url.startswith('http://') and not url.startswith('https://'):
                 url = 'https://' + url
 
-            if self.browser is None:
-                self.browser = await launch(headless=True,
-                                            ignoreDefaultArgs=["--enable-automation"],
-                                            ignoreHTTPSErrors=True,
-                                            args=['--no-sandbox', '--disable-dev-shm-usage', '--disable-gpu',
-                                                  '--disable-software-rasterizer', '--disable-setuid-sandbox'],
-                                            handleSIGINT=False, handleSIGTERM=False, handleSIGHUP=False)
-
-            page = await self.browser.newPage()
-            # 设置用户代理
-            await page.setUserAgent(random.choice(global_agent_headers))
-
-            # 设置页面视口大小并访问具体URL
-            width = 1920  # 默认宽度为 1920
-            height = 1080  # 默认高度为 1080
-            await page.setViewport({'width': width, 'height': height})
+            # 使用 requests 替代 pyppeteer
+            headers = {'User-Agent': random.choice(global_agent_headers)}
             try:
-                await page.goto(url, {'timeout': 60000, 'waitUntil': ['load', 'networkidle2']})
+                response = requests.get(url, headers=headers, timeout=30, verify=False)
+                response.raise_for_status()  # 确保请求成功
             except Exception as e:
-                logger.info(f'页面加载超时,不影响继续执行后续流程:{e}')
+                logger.error(f"获取页面内容失败: {url}, 错误: {str(e)}")
+                # 尝试再次请求，忽略 SSL 验证
+                try:
+                    response = requests.get(url, headers=headers, timeout=30, verify=False)
+                except Exception as e:
+                    logger.error(f"第二次尝试获取页面内容失败: {url}, 错误: {str(e)}")
+                    return None
 
-            # 获取网页内容
-            origin_content = await page.content()
+            # 使用 BeautifulSoup 解析 HTML
+            origin_content = response.text
             soup = BeautifulSoup(origin_content, 'html.parser')
 
             # 通过标签名提取内容
-            title = soup.title.string.strip() if soup.title else ''
+            title = soup.title.string.strip() if soup.title and soup.title.string else ''
 
             # 根据url提取域名生成name
             name = CommonUtil.get_name_by_url(url)
@@ -81,63 +78,103 @@ class WebsitCrawler:
             # 获取网页描述
             description = ''
             meta_description = soup.find('meta', attrs={'name': 'description'})
-            if meta_description:
+            if meta_description and 'content' in meta_description.attrs:
                 description = meta_description['content'].strip()
 
             if not description:
                 meta_description = soup.find('meta', attrs={'property': 'og:description'})
-                description = meta_description['content'].strip() if meta_description else ''
+                if meta_description and 'content' in meta_description.attrs:
+                    description = meta_description['content'].strip()
+            
+            # 如果仍然没有描述，尝试使用首段文本
+            if not description:
+                first_p = soup.find('p')
+                if first_p and first_p.text:
+                    description = first_p.text.strip()[:200]  # 限制长度
+            
+            logger.info(f"url:{url}, title:{title}, description:{description}")
 
-            logger.info(f"url:{url}, title:{title},description:{description}")
-
-            # 生成网站截图
+            # 不再生成网站截图，而是尝试获取网站的 favicon 或 logo
             image_key = oss.get_default_file_key(url)
-            dimensions = await page.evaluate(f'''(width, height) => {{
-                return {{
-                    width: {width},
-                    height: {height},
-                    deviceScaleFactor: window.devicePixelRatio
-                }};
-            }}''', width, height)
-            # 截屏并设置图片大小
-            screenshot_path = './' + url.replace("https://", "").replace("http://", "").replace("/", "").replace(".",
-                                                                                                                 "-") + '.png'
-            await page.screenshot({'path': screenshot_path, 'clip': {
-                'x': 0,
-                'y': 0,
-                'width': dimensions['width'],
-                'height': dimensions['height']
-            }})
-            # 上传图片，返回图片地址
-            screenshot_key = oss.upload_file_to_r2(screenshot_path, image_key)
-
-            # 生成缩略图
-            thumnbail_key = oss.generate_thumbnail_image(url, image_key)
+            screenshot_key = None
+            thumnbail_key = None
+            
+            # 尝试获取网站的 favicon 或 logo
+            favicon = soup.find('link', rel='icon') or soup.find('link', rel='shortcut icon')
+            logo = soup.find('meta', property='og:image')
+            
+            favicon_url = None
+            if favicon and 'href' in favicon.attrs:
+                favicon_url = favicon['href']
+            elif logo and 'content' in logo.attrs:
+                favicon_url = logo['content']
+                
+            if favicon_url:
+                # 处理相对路径
+                if favicon_url.startswith('/'):
+                    # 构建绝对 URL
+                    from urllib.parse import urlparse
+                    parsed_url = urlparse(url)
+                    base_url = f"{parsed_url.scheme}://{parsed_url.netloc}"
+                    favicon_url = base_url + favicon_url
+                
+                try:
+                    # 下载图标
+                    icon_response = requests.get(favicon_url, headers=headers, timeout=10, verify=False)
+                    if icon_response.status_code == 200:
+                        icon_path = f"./{name}_favicon.ico"
+                        with open(icon_path, 'wb') as f:
+                            f.write(icon_response.content)
+                        # 上传图标
+                        screenshot_key = oss.upload_file_to_r2(icon_path, image_key)
+                        thumnbail_key = screenshot_key  # 使用同一个图标作为缩略图
+                except Exception as e:
+                    logger.error(f"下载网站图标失败: {favicon_url}, 错误: {str(e)}")
 
             # 抓取整个网页内容
             content = soup.get_text()
 
             # 使用llm工具处理content
-            detail = llm.process_detail(content)
-            await page.close()
+            detail = None
+            try:
+                detail = llm.process_detail(content)
+            except Exception as e:
+                logger.error(f"处理内容失败: {str(e)}")
+                # 如果 LLM 处理失败，使用简单文本作为详情
+                detail = f"# {title}\n\n{description}\n\n"
+                
+                # 提取一些有意义的段落
+                paragraphs = soup.find_all('p')
+                for i, p in enumerate(paragraphs[:10]):  # 只提取前10个段落
+                    text = p.get_text().strip()
+                    if len(text) > 50:  # 只添加有意义的段落
+                        detail += f"{text}\n\n"
+                    if len(detail) > 1000:  # 限制长度
+                        break
 
             # 如果tags为非空数组，则使用llm工具处理tags
             processed_tags = None
-            if tags and detail:
-                processed_tags = llm.process_tags('tag_list is:' + ','.join(tags) + '. content is: ' + detail)
+            try:
+                if tags and detail:
+                    processed_tags = llm.process_tags('tag_list is:' + ','.join(tags) + '. content is: ' + detail)
+            except Exception as e:
+                logger.error(f"处理标签失败: {str(e)}")
 
             # 循环languages数组， 使用llm工具生成各种语言
             processed_languages = []
-            if languages:
-                for language in languages:
-                    logger.info("正在处理" + url + "站点，生成" + language + "语言")
-                    processed_title = llm.process_language(language, title)
-                    processed_description = llm.process_language(language, description)
-                    processed_detail = llm.process_language(language, detail)
-                    processed_languages.append({'language': language, 'title': processed_title,
-                                                'description': processed_description, 'detail': processed_detail})
+            try:
+                if languages:
+                    for language in languages:
+                        logger.info(f"正在处理{url}站点，生成{language}语言")
+                        processed_title = llm.process_language(language, title)
+                        processed_description = llm.process_language(language, description)
+                        processed_detail = llm.process_language(language, detail)
+                        processed_languages.append({'language': language, 'title': processed_title,
+                                                  'description': processed_description, 'detail': processed_detail})
+            except Exception as e:
+                logger.error(f"处理语言翻译失败: {str(e)}")
 
-            logger.info(url + "站点处理成功")
+            logger.info(f"{url}站点处理成功")
             return {
                 'name': name,
                 'url': url,
@@ -150,10 +187,11 @@ class WebsitCrawler:
                 'languages': processed_languages,
             }
         except Exception as e:
-            logger.error("处理" + url + "站点异常，错误信息:", e)
+            logger.error(f"处理{url}站点异常，错误信息: {str(e)}")
+            logger.error(traceback.format_exc())
             return None
         finally:
             # 计算程序执行时间
             execution_time = int(time.time()) - start_time
             # 输出程序执行时间
-            logger.info("处理" + url + "用时：" + str(execution_time) + " 秒")
+            logger.info(f"处理{url}用时：{execution_time}秒")
