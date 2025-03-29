@@ -1,5 +1,5 @@
 beautifulsoup4
-pyppeteer
+# pyppeteer  (注释掉或删除这一行)
 fastapi[all]
 uvicorn
 python-dotenv
